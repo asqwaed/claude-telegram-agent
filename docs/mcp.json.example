@@ -1,0 +1,49 @@
+{
+  "_comment": "Copy the parts you want into ~/.claude/mcp.json. Use python3 (not python) if your system has no python alias. Replace /ABSOLUTE/PATH and the API keys.",
+  "mcpServers": {
+    "local-tools": {
+      "command": "python3",
+      "args": ["/ABSOLUTE/PATH/to/claude-agent/mcp/server.py"],
+      "description": "local tools — files, shell, obsidian, gmail/drive/calendar, telegram MTProto, voice transcription"
+    },
+    "brave-search": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": { "BRAVE_API_KEY": "YOUR_BRAVE_KEY" }
+    },
+    "fetch": {
+      "command": "python3",
+      "args": ["-m", "mcp_server_fetch"]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GH_TOKEN" }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/Documents", "/Users/you/Downloads"]
+    },
+    "youtube": {
+      "command": "npx",
+      "args": ["-y", "@kimtaeyoon83/mcp-server-youtube-transcript"]
+    },
+    "sqlite": {
+      "command": "python3",
+      "args": ["-m", "mcp_server_sqlite"]
+    },
+    "spotify": {
+      "command": "npx",
+      "args": ["-y", "spotify-mcp"],
+      "env": {
+        "SPOTIFY_CLIENT_ID": "YOUR_SPOTIFY_ID",
+        "SPOTIFY_CLIENT_SECRET": "YOUR_SPOTIFY_SECRET",
+        "SPOTIFY_REDIRECT_URI": "http://localhost:8888/callback"
+      }
+    }
+  }
+}

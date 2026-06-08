@@ -1,0 +1,25 @@
+# --- Secrets — NEVER commit -------------------------------------------------
+.env
+*.session
+*.key
+*.token
+token.json
+
+# Credentials dir: keep only the helper *code*, drop every secret/token file.
+credentials/*
+!credentials/google_auth.py
+!credentials/telegram_auth.py
+!credentials/README.md
+
+# --- Private runtime data ---------------------------------------------------
+memory/
+agent.log*
+
+# --- Local tooling / editor / caches ---------------------------------------
+__pycache__/
+*.pyc
+.venv/
+.claude/
+.playwright-mcp/
+.vscode/
+.DS_Store

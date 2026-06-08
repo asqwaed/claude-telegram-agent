@@ -1,0 +1,27 @@
+# Telegram bot framework (async). The [job-queue] extra pulls in APScheduler,
+# which python-telegram-bot uses for scheduled/repeating jobs.
+python-telegram-bot[job-queue]==22.7
+
+# Loads variables from the .env file into the environment.
+python-dotenv
+
+# Note: asyncio is part of the Python standard library — no install required.
+
+# --- Phase 6: MCP / custom local-tools server ---
+# Framework for the custom local MCP server (mcp/server.py).
+fastmcp
+# Python-based MCP servers invoked from ~/.claude/mcp.json.
+mcp-server-sqlite
+mcp-server-fetch
+# Google API client + OAuth (gmail/drive/calendar tools and google_auth.py).
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+# Spotify auth helper.
+spotipy
+
+# --- Phase 7: Telegram MTProto (user account) + voice transcription ---
+# MTProto client for full user-account access (read chats, search, send as you).
+telethon
+# Local speech-to-text for transcribing voice messages (needs system ffmpeg).
+faster-whisper
