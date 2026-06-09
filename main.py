@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -118,6 +119,26 @@ def validate_environment() -> None:
     logger.info("Claude Code detected: %s", result.stdout.strip())
 
 
+async def _post_init(application) -> None:
+    """Register the bot's slash-command menu (the blue / button in Telegram)."""
+    from telegram import BotCommand
+
+    await application.bot.set_my_commands(
+        [
+            BotCommand("profile", "профиль — что я о тебе помню"),
+            BotCommand("note", "быстрая заметка в волт"),
+            BotCommand("today", "дневник за сегодня"),
+            BotCommand("find", "поиск по волту"),
+            BotCommand("usage", "расход токенов и лимиты"),
+            BotCommand("context", "наполненность контекста"),
+            BotCommand("compress", "сжать историю диалога"),
+            BotCommand("clear", "очистить историю диалога"),
+            BotCommand("help", "список команд"),
+        ]
+    )
+    logger.info("Bot command menu registered")
+
+
 def main() -> None:
     """Compose the application and start polling."""
     setup_logging()
@@ -130,7 +151,12 @@ def main() -> None:
     cmds = CommandHandlers()
 
     # Build the Telegram application.
-    application = ApplicationBuilder().token(config.TELEGRAM_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
     agent.application = application
 
     # Register handlers. Commands and plain text all route to handle_message,
@@ -150,6 +176,8 @@ def main() -> None:
     application.add_handler(
         MessageHandler(content_filter & ~filters.COMMAND, agent.handle_message)
     )
+    # Inline confirmation-button taps (✅ да / ✖️ отмена).
+    application.add_handler(CallbackQueryHandler(agent.handle_callback))
     for command in (
         "start", "clear", "help", "profile", "memory",
         "note", "today", "find", "context", "compress", "usage",
@@ -171,7 +199,8 @@ def main() -> None:
         application.add_handler(CommandHandler(name, callback))
 
     logger.info("Agent started")
-    application.run_polling(allowed_updates=["message"])
+    # Include callback_query so inline-button taps reach handle_callback.
+    application.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

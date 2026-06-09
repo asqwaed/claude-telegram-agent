@@ -17,12 +17,13 @@ import time
 import traceback
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import config
+from bot import cards
 from bot import transcribe
 from bot import usage as usage_tracker
 from bot import vault
@@ -64,6 +65,9 @@ HELP_MESSAGE = (
 class AgentHandler:
     """Handles Telegram updates by delegating reasoning to Claude Code."""
 
+    # Braille spinner frames for the live "thinking" indicator.
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
     def __init__(
         self,
         session_manager: SessionManager,
@@ -75,6 +79,9 @@ class AgentHandler:
         # Set by main.py once the Application is built, in case we ever need to
         # send messages outside of an update context.
         self.application = None
+        # Debounce for proactive rate-limit pings: {window: (resetsAt, tier)}.
+        # In-memory only — a bot restart may re-alert once, which is acceptable.
+        self._limit_alerted: dict[str, tuple] = {}
 
     # --- Access control ----------------------------------------------------
     def _is_allowed(self, user_id: int) -> bool:
@@ -227,7 +234,9 @@ class AgentHandler:
         return "\n\n".join(p for p in parts if p).strip() or "(пустое сообщение)"
 
     # --- Claude Code invocation helpers -----------------------------------
-    def _claude_cli_args(self, prompt: str, json_output: bool = False) -> list[str]:
+    def _claude_cli_args(
+        self, prompt: str, json_output: bool = False, stream: bool = False
+    ) -> list[str]:
         """Build the Claude Code CLI argv for a prompt.
 
         The curated MCP servers live in config.MCP_CONFIG_PATH, which Claude Code
@@ -236,8 +245,8 @@ class AgentHandler:
         be followed immediately by another flag — otherwise it swallows the
         prompt as a config path (ENAMETOOLONG). Keep the prompt strictly last.
 
-        ``json_output`` adds ``--output-format json`` so the result carries token
-        usage / cost metadata alongside the text.
+        ``json_output`` adds ``--output-format json`` (final result + usage).
+        ``stream`` adds ``--output-format stream-json`` (live event stream).
         """
         args = [config.CLAUDE_COMMAND]
         if config.MCP_CONFIG_PATH.is_file():
@@ -247,7 +256,13 @@ class AgentHandler:
                 "MCP config not found at %s; agent will run without MCP tools.",
                 config.MCP_CONFIG_PATH,
             )
-        if json_output:
+        if stream:
+            args += [
+                "--output-format", "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+            ]
+        elif json_output:
             args += ["--output-format", "json"]
         args += ["--print", "--dangerously-skip-permissions", prompt]
         return args
@@ -396,7 +411,9 @@ class AgentHandler:
         # 2. Anything that isn't a slash-command (text, photo, voice, forward,
         #    reply, file, …) is a conversation turn.
         if not (message.text and text.startswith("/")):
-            await self._handle_conversation(update, context, chat_id, text)
+            await self._handle_conversation(
+                update.effective_message, context, chat_id, text
+            )
             return
 
         # 3. Commands.
@@ -472,15 +489,35 @@ class AgentHandler:
                         photo=io.BytesIO(png),
                         caption="📈 токены по дням",
                     )
-            else:
+            elif arg == "text":
                 await message.reply_text(
                     usage_tracker.infographic(), parse_mode=ParseMode.HTML
                 )
+            else:
+                png = None
+                try:
+                    png = cards.usage_card()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("usage card render failed: %s", exc)
+                if png:
+                    await message.reply_photo(photo=io.BytesIO(png))
+                else:
+                    await message.reply_text(
+                        usage_tracker.infographic(), parse_mode=ParseMode.HTML
+                    )
             return
         if text.startswith("/context"):
-            await message.reply_text(
-                self._context_report(chat_id), parse_mode=ParseMode.HTML
-            )
+            png = None
+            try:
+                png = cards.context_card(self.session.context_stats(chat_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("context card render failed: %s", exc)
+            if png:
+                await message.reply_photo(photo=io.BytesIO(png))
+            else:
+                await message.reply_text(
+                    self._context_report(chat_id), parse_mode=ParseMode.HTML
+                )
             return
         if text.startswith("/compress"):
             note = await message.reply_text("⏳ сжимаю историю...")
@@ -489,32 +526,45 @@ class AgentHandler:
             return
 
         # 4. Unknown slash-command → treat as a normal conversation turn.
-        await self._handle_conversation(update, context, chat_id, text)
+        await self._handle_conversation(
+            update.effective_message, context, chat_id, text
+        )
 
     async def _handle_conversation(
         self,
-        update: Update,
+        message,
         context: ContextTypes.DEFAULT_TYPE,
         chat_id: int,
         text: str,
+        gather: bool = True,
     ) -> None:
-        """Run a single Claude Code turn with a live thinking indicator."""
+        """Run a single Claude Code turn with a live thinking indicator.
+
+        ``message`` is the Telegram message to reply under / react to. ``gather``
+        controls whether to extract media/reply/forward context from it (skip it
+        for synthetic turns like a confirmation-button tap).
+        """
         start_time = time.monotonic()
-        message = update.effective_message
+
+        # a0. Acknowledge instantly with a reaction + a native typing action,
+        #     so the user sees it's working before the answer is ready.
+        await self._react(message, "👀")
+        await self._send_typing(context, chat_id)
 
         # a/b. Send the initial thinking message, tailored to the content kind.
-        kind = self._message_kind(message)
+        kind = self._message_kind(message) if gather else "text"
         thinking_text = {
-            "voice": "🎧 слушаю голосовое...",
-            "audio": "🎧 слушаю аудио...",
-            "video_note": "🎧 слушаю кружок...",
-            "photo": "👀 смотрю картинку...",
-        }.get(kind, "⏳ Thinking...")
+            "voice": "🎧 слушаю голосовое…",
+            "audio": "🎧 слушаю аудио…",
+            "video_note": "🎧 слушаю кружок…",
+            "photo": "👀 смотрю картинку…",
+        }.get(kind, f"{self.SPINNER[0]} думаю…")
         thinking = await message.reply_text(thinking_text)
 
         # c. Gather all input (text + reply/forward context + voice transcript +
         #    downloaded images/files) into one enriched message, then record it.
-        text = await self._gather_input(message, text)
+        if gather:
+            text = await self._gather_input(message, text)
         self.session.add_message(chat_id, "user", text)
 
         # c2. Auto-compress the history if the context budget is exceeded, so
@@ -528,48 +578,35 @@ class AgentHandler:
         # d. Build the full prompt.
         prompt = self._build_prompt(chat_id, text)
 
-        proc: asyncio.subprocess.Process | None = None
         try:
-            # e. Launch Claude Code in headless mode (JSON output carries token
-            #    usage / cost metadata alongside the text).
-            proc = await asyncio.create_subprocess_exec(
-                *self._claude_cli_args(prompt, json_output=True),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(config.BASE_DIR),
+            # e/f. Run Claude Code. Streaming live-updates the thinking message
+            #      with the work as it happens; one-shot is the fallback path.
+            runner = self._stream_claude if config.STREAMING else self._oneshot_claude
+            stdout, usage, err = await runner(
+                prompt, context, chat_id, thinking.message_id, start_time
             )
-
-            # f. Drive the subprocess while animating the thinking message.
-            stdout_b, stderr_b = await self._run_with_progress(
-                proc, context, chat_id, thinking.message_id, start_time
-            )
-
-            raw_stdout = stdout_b.decode("utf-8", errors="replace").strip()
-            stderr = stderr_b.decode("utf-8", errors="replace").strip()
-
-            # Split the JSON envelope into reply text + usage; record usage.
-            stdout, usage = self._parse_claude_json(raw_stdout)
-            stdout = stdout.strip()
             if usage:
                 usage_tracker.record(chat_id, usage)
 
-            if proc.returncode != 0:
-                # Subprocess failed; surface a trimmed stderr to the user.
-                detail = stderr or stdout or "unknown error"
+            if err:
                 logger.error(
-                    "Claude Code FAILED chat_id=%s exit=%s elapsed=%.2fs: %s",
+                    "Claude Code FAILED chat_id=%s elapsed=%.2fs: %s",
                     chat_id,
-                    proc.returncode,
                     time.monotonic() - start_time,
-                    detail[:500],
+                    err[:500],
                 )
+                await self._react(message, "❌")
                 await self._edit(
                     context,
                     chat_id,
                     thinking.message_id,
-                    f"❌ Claude Code error: {detail[:500]}",
+                    f"❌ Claude Code error: {err[:500]}",
                 )
                 return
+
+            stdout = (stdout or "").strip()
+            # Detect the agent's confirmation sentinel → show Yes/No buttons.
+            stdout, wants_confirm = self._extract_confirm(stdout)
 
             if not stdout:
                 logger.warning(
@@ -587,6 +624,11 @@ class AgentHandler:
 
             # g. Success: persist, format, and deliver the response.
             self.session.add_message(chat_id, "assistant", stdout)
+            await self._react(message, "✅")
+
+            elapsed = time.monotonic() - start_time
+            # Subtle "thought for Xs" header above the answer.
+            header = f"<i>💭 {int(elapsed)}s</i>\n"
 
             # Delete the thinking message, then deliver the response. A very
             # large single code block is sent as a file instead of inlined.
@@ -597,14 +639,20 @@ class AgentHandler:
                 file_uploaded = True
             else:
                 file_uploaded = False
-                for chunk in self.formatter.format_for_telegram(stdout):
+                chunks = list(self.formatter.format_for_telegram(stdout))
+                for i, chunk in enumerate(chunks):
+                    # Attach the confirm keyboard to the last chunk only.
+                    markup = (
+                        self._confirm_keyboard()
+                        if wants_confirm and i == len(chunks) - 1
+                        else None
+                    )
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=chunk,
+                        text=(header + chunk) if i == 0 else chunk,
                         parse_mode=ParseMode.HTML,
+                        reply_markup=markup,
                     )
-
-            elapsed = time.monotonic() - start_time
             tok = (
                 f" in={usage['input']} out={usage['output']} "
                 f"cost=${usage['cost']:.4f}"
@@ -647,14 +695,6 @@ class AgentHandler:
                 thinking.message_id,
                 f"❌ Error: {exc}",
             )
-        finally:
-            # Always make sure the subprocess is not left running.
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except ProcessLookupError:
-                    pass
 
     # --- Subprocess driving ------------------------------------------------
     async def _run_with_progress(
@@ -671,12 +711,11 @@ class AgentHandler:
         ``CLAUDE_TIMEOUT`` seconds elapse without completion.
         """
         comm_task = asyncio.ensure_future(proc.communicate())
-        dots = 3  # "⏳ Thinking..." already shows three dots.
+        frame = 0
+        tick = 2.0  # seconds between spinner updates
 
         while True:
-            done, _ = await asyncio.wait(
-                {comm_task}, timeout=config.THINKING_UPDATE_INTERVAL
-            )
+            done, _ = await asyncio.wait({comm_task}, timeout=tick)
             if comm_task in done:
                 return comm_task.result()
 
@@ -690,15 +729,211 @@ class AgentHandler:
                     pass
                 raise asyncio.TimeoutError
 
-            # Animate by growing the dot trail; Telegram rejects no-op edits, so
-            # the text must actually change each tick.
-            dots += 1
+            # Spinner + live elapsed timer; refresh the native typing action too.
+            frame += 1
+            spin = self.SPINNER[frame % len(self.SPINNER)]
             await self._edit(
-                context,
-                chat_id,
-                message_id,
-                "⏳ Thinking" + ("." * dots),
+                context, chat_id, message_id, f"{spin} думаю · {int(elapsed)}s"
             )
+            await self._send_typing(context, chat_id)
+
+    async def _oneshot_claude(
+        self, prompt, context, chat_id, message_id, start_time
+    ) -> tuple[str | None, dict | None, str | None]:
+        """Run Claude once (JSON output) with a spinner. → (text, usage, err)."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._claude_cli_args(prompt, json_output=True),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(config.BASE_DIR),
+        )
+        try:
+            stdout_b, stderr_b = await self._run_with_progress(
+                proc, context, chat_id, message_id, start_time
+            )
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+        raw = stdout_b.decode("utf-8", "replace").strip()
+        stderr = stderr_b.decode("utf-8", "replace").strip()
+        text, usage = self._parse_claude_json(raw)
+        if proc.returncode not in (0, None):
+            return None, usage, (stderr or text or f"exit {proc.returncode}")
+        return text, usage, None
+
+    @staticmethod
+    def _usage_from_result(ev: dict) -> dict:
+        """Build a usage dict from a stream-json ``result`` event."""
+        u = ev.get("usage") or {}
+        return {
+            "input": int(u.get("input_tokens", 0) or 0),
+            "output": int(u.get("output_tokens", 0) or 0),
+            "cache_read": int(u.get("cache_read_input_tokens", 0) or 0),
+            "cache_creation": int(u.get("cache_creation_input_tokens", 0) or 0),
+            "cost": float(ev.get("total_cost_usd", 0.0) or 0.0),
+            "duration_ms": int(ev.get("duration_ms", 0) or 0),
+            "turns": int(ev.get("num_turns", 0) or 0),
+        }
+
+    def _stream_preview(self, text: str, tool_note: str, secs: int) -> str:
+        """Plain-text live preview shown while the agent works."""
+        spin = self.SPINNER[secs % len(self.SPINNER)]
+        head = f"{spin} {secs}s"
+        if tool_note:
+            head += f"  ·  {tool_note}"
+        body = (text or "")[-900:].strip()
+        return f"{head}\n\n{body}▌" if body else head
+
+    @staticmethod
+    def _limit_tier(info: dict) -> str | None:
+        """Classify a rate_limit_info into an alert tier, or None if fine.
+
+        'blocked' — throttled/rejected (requests held until reset).
+        'warning' — near the ceiling (status warns, or utilization >= 0.9).
+        """
+        status = (info.get("status") or "").lower()
+        if "reject" in status or "throttl" in status:
+            return "blocked"
+        try:
+            util = float(info.get("utilization") or 0)
+        except (TypeError, ValueError):
+            util = 0.0
+        if "warning" in status or util >= 0.9:
+            return "warning"
+        return None
+
+    async def _maybe_alert_limit(self, info: dict, context, chat_id) -> None:
+        """Proactively ping the user when a window crosses into warning/blocked.
+
+        Debounced per window per reset cycle and per severity: a given reset
+        window pings at most once for 'warning' and once for 'blocked'.
+        """
+        tier = self._limit_tier(info)
+        if tier is None:
+            return
+        win = info.get("rateLimitType") or "five_hour"
+        resets = info.get("resetsAt")
+        rank = {"warning": 1, "blocked": 2}
+        prev = self._limit_alerted.get(win)
+        # Skip if we've already alerted this reset cycle at >= this severity.
+        if prev and prev[0] == resets and rank[prev[1]] >= rank[tier]:
+            return
+        self._limit_alerted[win] = (resets, tier)
+
+        eta = usage_tracker._eta(resets)
+        eta_s = f", сброс через {eta}" if eta else ""
+        label = "5ч-окно" if win == "five_hour" else "недельный лимит"
+        try:
+            pct = round(float(info.get("utilization") or 0) * 100)
+        except (TypeError, ValueError):
+            pct = None
+        pct_s = f" ({pct}%)" if pct is not None else ""
+        if tier == "blocked":
+            text = (f"🛑 упёрся в лимит — {label}{pct_s}{eta_s}\n"
+                    f"<i>запросы будут тормозить пока не сбросится</i>")
+        else:
+            text = f"⚠️ почти лимит — {label}{pct_s}{eta_s}"
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="HTML"
+            )
+        except Exception as exc:  # noqa: BLE001 — alert is best-effort.
+            logger.warning("Limit alert send failed: %s", exc)
+
+    async def _stream_claude(
+        self, prompt, context, chat_id, message_id, start_time
+    ) -> tuple[str | None, dict | None, str | None]:
+        """Run Claude with stream-json, live-updating the message as it works.
+
+        Returns (final_text, usage, err). The live preview is throwaway plain
+        text; the final answer comes from the ``result`` event (authoritative).
+        """
+        proc = await asyncio.create_subprocess_exec(
+            *self._claude_cli_args(prompt, stream=True),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(config.BASE_DIR),
+            limit=2 ** 20,  # 1 MB lines (stream-json results can be large)
+        )
+
+        async def _watchdog():
+            await asyncio.sleep(config.CLAUDE_TIMEOUT)
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
+        wd = asyncio.ensure_future(_watchdog())
+        preview, tool_note = "", ""
+        final_text, usage, got_delta = None, None, False
+        last_edit, last_shown = 0.0, ""
+
+        try:
+            async for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if line:
+                    try:
+                        ev = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        ev = None
+                    if isinstance(ev, dict):
+                        et = ev.get("type")
+                        if et == "stream_event":
+                            d = ev.get("event", {}) or {}
+                            if d.get("type") == "content_block_delta":
+                                delta = d.get("delta", {}) or {}
+                                if delta.get("type") == "text_delta":
+                                    got_delta = True
+                                    preview += delta.get("text", "")
+                        elif et == "assistant":
+                            for block in (ev.get("message", {}) or {}).get("content", []) or []:
+                                bt = block.get("type")
+                                if bt == "text" and not got_delta:
+                                    txt = block.get("text", "")
+                                    if len(txt) > len(preview):
+                                        preview = txt
+                                elif bt == "tool_use":
+                                    tool_note = f"🔧 {block.get('name', 'tool')}"
+                        elif et == "rate_limit_event":
+                            info = ev.get("rate_limit_info") or {}
+                            if info:
+                                usage_tracker.record_live_limit(info)
+                                await self._maybe_alert_limit(info, context, chat_id)
+                        elif et == "result":
+                            final_text = ev.get("result") or preview
+                            usage = self._usage_from_result(ev)
+
+                now = time.monotonic()
+                if now - last_edit >= 1.2:
+                    prev = self._stream_preview(preview, tool_note, int(now - start_time))
+                    if prev and prev != last_shown:
+                        await self._edit(context, chat_id, message_id, prev)
+                        last_shown = prev
+                        await self._send_typing(context, chat_id)
+                    last_edit = now
+        except Exception as exc:  # noqa: BLE001 — keep whatever we streamed.
+            logger.warning("Stream read error (using partial): %s", exc)
+        finally:
+            wd.cancel()
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+
+        stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
+        if (time.monotonic() - start_time) >= config.CLAUDE_TIMEOUT and final_text is None:
+            raise asyncio.TimeoutError
+        result = final_text if final_text is not None else (preview or None)
+        if result is None:
+            return None, usage, (stderr[:400] or "no output from claude")
+        return result, usage, None
 
     async def _send_with_file(
         self,
@@ -761,3 +996,61 @@ class AgentHandler:
             )
         except TelegramError as exc:
             logger.debug("Delete message failed (ignored): %s", exc)
+
+    async def _react(self, message, emoji: str) -> None:
+        """Set an emoji reaction on a message, ignoring failures."""
+        try:
+            await message.set_reaction(emoji)
+        except TelegramError as exc:
+            logger.debug("Reaction failed (ignored): %s", exc)
+
+    async def _send_typing(
+        self, context: ContextTypes.DEFAULT_TYPE, chat_id: int
+    ) -> None:
+        """Show the native 'typing…' chat action, ignoring failures."""
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except TelegramError as exc:
+            logger.debug("Chat action failed (ignored): %s", exc)
+
+    # --- Confirmation buttons ---------------------------------------------
+    @staticmethod
+    def _extract_confirm(text: str) -> tuple[str, bool]:
+        """Strip the agent's ``[[CONFIRM]]`` sentinel; return (clean_text, wanted)."""
+        marker = "[[CONFIRM]]"
+        if marker in text:
+            return text.replace(marker, "").strip(), True
+        return text, False
+
+    @staticmethod
+    def _confirm_keyboard() -> InlineKeyboardMarkup:
+        """Inline Yes / Cancel keyboard for a pending sensitive action."""
+        return InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ да", callback_data="cf:yes"),
+                InlineKeyboardButton("✖️ отмена", callback_data="cf:no"),
+            ]]
+        )
+
+    async def handle_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle a confirm-button tap: run a turn with 'да' / 'нет'."""
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if not self._is_allowed(query.from_user.id):
+            return
+        choice = {"cf:yes": "да", "cf:no": "нет, отмена"}.get(query.data or "")
+        # Remove the buttons so they can't be tapped twice.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError as exc:
+            logger.debug("Clearing buttons failed (ignored): %s", exc)
+        if choice is None:
+            return
+        chat_id = query.message.chat.id
+        await self._handle_conversation(
+            query.message, context, chat_id, choice, gather=False
+        )

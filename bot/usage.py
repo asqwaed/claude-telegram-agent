@@ -14,6 +14,9 @@ import config
 logger = logging.getLogger(__name__)
 
 USAGE_FILE = config.MEMORY_DIR / "usage.jsonl"
+# Latest live rate-limit info captured from the stream-json ``rate_limit_event``
+# (one entry per window). Fresher than the statusline snapshot.
+LIVE_LIMITS_FILE = config.MEMORY_DIR / "ratelimit_live.json"
 
 
 # --- recording -------------------------------------------------------------
@@ -159,37 +162,150 @@ def official_limits() -> dict | None:
     return {"five_hour": fh, "seven_day": sd, "age_min": age_min}
 
 
-def _limit_line(label: str, obj: dict | None) -> str | None:
-    if not obj:
+# --- live subscription limits (from the stream-json rate_limit_event) ------
+def record_live_limit(info: dict) -> None:
+    """Persist one ``rate_limit_info`` from a stream event (best-effort).
+
+    Stored per window (five_hour / seven_day) with a capture timestamp so the
+    freshest source can be chosen later. Never raises into the caller.
+    """
+    rtype = info.get("rateLimitType")
+    if not rtype:
+        return
+    try:
+        data: dict = {}
+        if LIVE_LIMITS_FILE.exists():
+            try:
+                data = json.loads(LIVE_LIMITS_FILE.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, ValueError):
+                data = {}
+        now = datetime.now().timestamp()
+        data[rtype] = {
+            "utilization": info.get("utilization"),
+            "status": info.get("status"),
+            "resetsAt": info.get("resetsAt"),
+            "isUsingOverage": info.get("isUsingOverage"),
+            "ts": now,
+        }
+        data["updated_at"] = now
+        LIVE_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LIVE_LIMITS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("Failed to write live limit: %s", exc)
+
+
+def live_limits() -> dict | None:
+    """Read the live rate-limit cache, or None if absent/unreadable."""
+    if not LIVE_LIMITS_FILE.exists():
         return None
     try:
-        pct = round(float(obj.get("used_percentage", 0)))
+        return json.loads(LIVE_LIMITS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _norm_live(e: dict | None) -> dict | None:
+    if not e:
+        return None
+    u = e.get("utilization")
+    try:
+        pct = round(float(u) * 100) if u is not None else None
     except (TypeError, ValueError):
-        pct = 0
-    eta = _eta(obj.get("resets_at"))
+        pct = None
+    return {"pct": pct, "status": e.get("status"), "resets_at": e.get("resetsAt"),
+            "ts": e.get("ts"), "source": "stream"}
+
+
+def _norm_official(e: dict | None, cap) -> dict | None:
+    if not e:
+        return None
+    try:
+        pct = round(float(e.get("used_percentage", 0)))
+    except (TypeError, ValueError):
+        pct = None
+    return {"pct": pct, "status": None, "resets_at": e.get("resets_at"),
+            "ts": cap, "source": "statusline"}
+
+
+def merged_limits() -> dict | None:
+    """Per-window limits merging the live stream events and the statusline
+    snapshot, preferring whichever window was captured more recently.
+
+    Returns ``{"five_hour": {...}|None, "seven_day": {...}|None}`` where each
+    entry has ``pct, status, resets_at, ts, source`` — or None if no source has
+    any data at all.
+    """
+    live = live_limits() or {}
+    off_raw: dict = {}
+    p = config.RATELIMITS_FILE
+    if p.exists():
+        try:
+            off_raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            off_raw = {}
+    off_cap = off_raw.get("captured_at")
+
+    out: dict = {}
+    for win in ("five_hour", "seven_day"):
+        cands = [c for c in (_norm_live(live.get(win)),
+                             _norm_official(off_raw.get(win), off_cap)) if c]
+        if not cands:
+            out[win] = None
+            continue
+        cands.sort(key=lambda c: c.get("ts") or 0, reverse=True)
+        out[win] = cands[0]
+    if out["five_hour"] is None and out["seven_day"] is None:
+        return None
+    return out
+
+
+def _status_icon(status: str | None) -> str:
+    if not status:
+        return ""
+    s = status.lower()
+    if "reject" in s or "throttl" in s:
+        return " 🛑"
+    if "warning" in s:
+        return " ⚠️"
+    if "allow" in s:
+        return " ✅"
+    return ""
+
+
+def _limit_line(label: str, w: dict | None) -> str | None:
+    if not w:
+        return None
+    pct = w.get("pct")
+    eta = _eta(w.get("resets_at"))
     eta_s = f"  сброс {eta}" if eta else ""
-    return f"{label} {_bar(pct, 100)} {pct}%{eta_s}"
+    pct_s = f"{pct}%" if pct is not None else "—"
+    return f"{label} {_bar(pct or 0, 100)} {pct_s}{_status_icon(w.get('status'))}{eta_s}"
 
 
 def limits_block() -> str:
-    """HTML block with the official 5h + weekly limits (or a hint if missing)."""
-    lim = official_limits()
+    """HTML block with the 5h + weekly limits (or a hint if missing)."""
+    lim = merged_limits()
     if lim is None:
         return (
             "🔋 <b>Лимиты Claude</b>\n"
-            "<i>нет данных — открой Claude Code интерактивно, чтобы статусбар "
-            "подтянул официальные 5ч/недельный лимиты</i>"
+            "<i>нет данных — отправь любой запрос (стрим подтянет свежий статус) "
+            "или открой Claude Code интерактивно</i>"
         )
-    lines = ["🔋 <b>Лимиты Claude (официально)</b>"]
-    l5 = _limit_line("5ч ", lim["five_hour"])
-    l7 = _limit_line("нед", lim["seven_day"])
-    if l5:
-        lines.append(l5)
-    if l7:
-        lines.append(l7)
-    if lim["age_min"] is not None:
-        freshness = "только что" if lim["age_min"] == 0 else f"{lim['age_min']} мин назад"
-        lines.append(f"<i>обновлено {freshness}</i>")
+    lines = ["🔋 <b>Лимиты Claude</b>"]
+    newest_ts = 0.0
+    for label, win in (("5ч ", "five_hour"), ("нед", "seven_day")):
+        line = _limit_line(label, lim.get(win))
+        if line:
+            lines.append(line)
+            w = lim[win]
+            if w.get("ts"):
+                newest_ts = max(newest_ts, float(w["ts"]))
+    if newest_ts:
+        age_min = max(0, int((datetime.now().timestamp() - newest_ts) / 60))
+        fresh = "только что" if age_min == 0 else f"{age_min} мин назад"
+        lines.append(f"<i>обновлено {fresh}</i>")
     return "\n".join(lines)
 
 
