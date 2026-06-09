@@ -46,8 +46,10 @@ your language. Edit that file to give it whatever personality you want.
 Telegram  ──>  bot (python-telegram-bot)  ──>  claude --print (headless)
                      │                              │
                      │                              ├─ MCP: local-tools (files, shell,
-                     │                              │       obsidian, gmail/drive/calendar,
-                     │                              │       telegram MTProto, voice STT)
+                     │                              │       obsidian, telegram MTProto,
+                     │                              │       voice STT)
+                     │                              ├─ Bash: gog (gogcli) for Gmail/
+                     │                              │        Drive/Calendar/Docs
                      │                              └─ MCP: brave-search, fetch, playwright,
                      │                                      github, youtube, spotify, sqlite
                      ▼
@@ -116,14 +118,20 @@ Add `brave-search`, `fetch`, `playwright`, `github`, `youtube`, `spotify`,
 `filesystem` as desired (all are `npx`/`python3 -m` based). **Use `python3`, not
 `python`**, if your system has no `python` alias.
 
-### 4. (Optional) Google accounts
-For Gmail/Drive/Calendar, download an OAuth **Desktop app** client JSON from
-Google Cloud Console into `credentials/google_credentials.json`, set
-`GOOGLE_ACCOUNTS=personal` (or `personal,work`) in `.env`, then authorize each:
+### 4. (Optional) Google accounts — via gogcli
+Gmail/Drive/Calendar/Docs are handled by the [`gog`](https://gogcli.sh/) binary
+(called through Bash, so its command schemas don't bloat the model's context).
+Install it, register an OAuth **Desktop app** client JSON from Google Cloud
+Console, then authorize each account:
 ```bash
-python credentials/google_auth.py personal
-python credentials/google_auth.py work
+brew install openclaw/tap/gogcli            # or see gogcli.sh for other installs
+gog auth credentials set credentials.json --client default
+gog auth add you@gmail.com --services gmail,calendar,drive --client default
+gog auth add you@work.com  --services gmail,calendar,drive --client default
+gog auth alias set personal you@gmail.com   # friendly -a aliases
+gog auth alias set work     you@work.com
 ```
+The agent then runs e.g. `gog -a personal --plain gmail search "is:unread"`.
 
 ### 5. (Optional) Telegram user account(s)
 For the `tg_*` tools, get `api_id`/`api_hash` from

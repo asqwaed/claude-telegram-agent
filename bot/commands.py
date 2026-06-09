@@ -28,6 +28,32 @@ _BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_BASE_DIR / "mcp"))
 import server as local_tools  # noqa: E402
 
+import subprocess  # noqa: E402
+
+
+def _run_gog(args: list[str], timeout: int = 30) -> str:
+    """Run the gogcli (`gog`) binary and return combined human-readable output.
+
+    Gmail/Calendar/Drive moved from the in-process Google MCP tools to the
+    standalone gogcli binary (invoked via the shell) — zero per-request tool
+    schema in context. These /gmail, /calendar shims are quick manual checks;
+    the agent itself calls `gog` through Bash.
+    """
+    try:
+        proc = subprocess.run(
+            ["gog", *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return "error: gog не установлен (brew install openclaw/tap/gogcli)"
+    except subprocess.TimeoutExpired:
+        return "error: gog timeout"
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return f"error: {err or out or f'gog exit {proc.returncode}'}"
+    return out or err or "(пусто)"
+
 MAX_CHUNK = 4000
 
 
@@ -97,33 +123,35 @@ class CommandHandlers:
         )
 
     async def gmail(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """List recent emails (optional Gmail search query)."""
+        """List recent emails via gogcli (optional Gmail search query)."""
         if not await self._guard(update):
             return
-        query = _args_text(update, "gmail")
+        query = _args_text(update, "gmail") or "newer_than:7d"
         logger.info("/gmail query=%r", query)
         result = await asyncio.to_thread(
-            local_tools.gmail_read, 10, query
+            _run_gog, ["-a", "personal", "--plain", "gmail", "search", query, "--max", "10"]
         )
         await _reply_long(update, result)
 
     async def mail_full(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Show the full body of an email by message id."""
+        """Show the full body of an email by message id via gogcli."""
         if not await self._guard(update):
             return
         msg_id = _args_text(update, "mail_full")
         if not msg_id:
             await update.effective_message.reply_text("укажи id: /mail_full <id>")
             return
-        result = await asyncio.to_thread(local_tools.gmail_read_full, msg_id)
+        result = await asyncio.to_thread(
+            _run_gog, ["-a", "personal", "gmail", "get", msg_id]
+        )
         await _reply_long(update, result)
 
     async def calendar(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """List upcoming calendar events for N days."""
+        """List upcoming calendar events for N days via gogcli."""
         if not await self._guard(update):
             return
         arg = _args_text(update, "calendar")
@@ -131,7 +159,10 @@ class CommandHandlers:
             days = int(arg) if arg else 7
         except ValueError:
             days = 7
-        result = await asyncio.to_thread(local_tools.calendar_list_events, days)
+        result = await asyncio.to_thread(
+            _run_gog,
+            ["-a", "personal", "--plain", "calendar", "events", "--days", str(days)],
+        )
         await _reply_long(update, result)
 
     async def ls(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
