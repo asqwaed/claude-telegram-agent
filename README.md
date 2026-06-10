@@ -150,8 +150,9 @@ Obsidian as a vault. The agent will populate it.
 ```bash
 python main.py
 ```
-Message your bot on Telegram. To keep it running, use a process manager
-(`nohup`, `pm2`, `systemd`, `launchd`).
+Message your bot on Telegram. To keep it running 24/7 (auto-restart on crash,
+network blip, or reboot), see [`deploy/`](deploy/README.md) for a ready-made
+macOS **launchd** LaunchAgent — or use any process manager (`pm2`, `systemd`).
 
 ## Commands
 

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd LaunchAgent template for running the bot 24/7.
+
+  It restarts the bot automatically on crash, network blip, or reboot
+  (KeepAlive), and starts it at login (RunAtLoad).
+
+  Before using, replace every __PLACEHOLDER__ below:
+    __PYTHON__   absolute path to python3   (run: which python3)
+    __PROJECT__  absolute path to this repo (e.g. /Users/you/claude-agent)
+    __PATH__     a PATH that resolves your CLI tools, e.g. claude, gog, npx
+                 (run: echo "$PATH" in your normal shell and paste it)
+
+  Then install it (see deploy/README.md):
+    cp deploy/com.example.claude-agent.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.claude-agent.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.claude-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT__/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT__</string>
+
+    <!-- launchd starts with a minimal PATH; the bot shells out to claude, gog,
+         npx, python3, so spell out a PATH that resolves them. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <!-- Restart whenever the bot exits (crash, network blip, reboot). -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Don't respawn faster than every 10s if it's crash-looping. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- launchd's own stdout/stderr (separate from the app's rotating
+         agent.log, so it doesn't fight the RotatingFileHandler). -->
+    <key>StandardOutPath</key>
+    <string>__PROJECT__/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT__/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
