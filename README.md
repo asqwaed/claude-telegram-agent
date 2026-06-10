@@ -177,6 +177,12 @@ macOS **launchd** LaunchAgent — or use any process manager (`pm2`, `systemd`).
 - Restrict the bot with `ALLOWED_USERS`. Anyone else who messages it is refused.
 - The agent runs commands with your user's permissions. Only run it on machines
   and networks you trust.
+- **Defense-in-depth hooks** ([`hooks/`](hooks/), wired in `.claude/settings.json`)
+  enforce safety at the Claude Code level, not just via prompt: `PreToolUse`
+  hooks block destructive shell commands and any access to secret files
+  (`.env`, `*.session`, `*.key`, `*.token`, `credentials/`); a `UserPromptSubmit`
+  hook captures correction episodes to `memory/episodes.jsonl` for later
+  self-learning. Run `python3 hooks/_test_hooks.py` to verify them.
 
 ## License
 

@@ -19,7 +19,8 @@ agent.log*
 __pycache__/
 *.pyc
 .venv/
-.claude/
+.claude/*
+!.claude/settings.json
 .playwright-mcp/
 .vscode/
 .DS_Store
