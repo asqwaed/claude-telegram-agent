@@ -120,8 +120,18 @@ def validate_environment() -> None:
 
 
 async def _post_init(application) -> None:
-    """Register the bot's slash-command menu (the blue / button in Telegram)."""
+    """Register the slash-command menu and confirm a healthy (re)start.
+
+    Reaching this point means imports succeeded, config loaded, the Telegram
+    Application was built, and the command-menu API call below round-trips — so
+    the token is valid and Telegram is reachable. That's our "the bot is up"
+    signal: we mark this revision healthy (clearing the boot-failure counter and
+    pinning it as last-known-good) and, if the last boot was a self-update or an
+    auto-rollback, report the outcome to the user.
+    """
     from telegram import BotCommand
+
+    from bot import selfupdate
 
     await application.bot.set_my_commands(
         [
@@ -133,10 +143,17 @@ async def _post_init(application) -> None:
             BotCommand("context", "наполненность контекста"),
             BotCommand("compress", "сжать историю диалога"),
             BotCommand("clear", "очистить историю диалога"),
+            BotCommand("model", "показать / сменить модель и effort"),
+            BotCommand("stop", "остановить текущую задачу"),
+            BotCommand("restart", "перезапустить бота"),
             BotCommand("help", "список команд"),
         ]
     )
     logger.info("Bot command menu registered")
+
+    # The boot succeeded — record it as known-good and report any self-update.
+    selfupdate.mark_healthy()
+    await selfupdate.notify_after_boot(application.bot)
 
 
 def main() -> None:
@@ -155,6 +172,10 @@ def main() -> None:
         ApplicationBuilder()
         .token(config.TELEGRAM_TOKEN)
         .post_init(_post_init)
+        # Process updates concurrently so a /stop (or any quick command) is
+        # handled while a long Claude Code turn is still running, instead of
+        # queuing behind it.
+        .concurrent_updates(True)
         .build()
     )
     agent.application = application
@@ -180,7 +201,8 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(agent.handle_callback))
     for command in (
         "start", "clear", "help", "profile", "memory",
-        "note", "today", "find", "context", "compress", "usage",
+        "note", "today", "find", "context", "compress", "usage", "restart",
+        "model", "stop",
     ):
         application.add_handler(CommandHandler(command, agent.handle_message))
 

@@ -150,14 +150,25 @@ CONTEXT_TOKEN_LIMIT: int = 12000
 # older is collapsed into a single summary entry.
 COMPRESS_KEEP_RECENT: int = 8
 
-# Seconds to wait for the Claude Code subprocess before killing it.
-CLAUDE_TIMEOUT: int = 120
+# Seconds to wait for the Claude Code subprocess before killing it. Generous so
+# multi-step coding tasks aren't cut off mid-run; a live timer shows elapsed.
+CLAUDE_TIMEOUT: int = 600
 
 # Seconds between "thinking" status updates sent to the user.
 THINKING_UPDATE_INTERVAL: int = 5
 
 # The Claude Code CLI command. Overridable via the CLAUDE_COMMAND env var.
 CLAUDE_COMMAND: str = os.getenv("CLAUDE_COMMAND", "claude")
+
+# Active model alias and effort level for the agent (see bot/model.py). Stored
+# as tiny files so they survive restarts and are read fresh each turn; switching
+# takes effect on the next message. Absent → bot.model.DEFAULT_ALIAS / _EFFORT.
+MODEL_FILE: Path = MEMORY_DIR / "model"
+EFFORT_FILE: Path = MEMORY_DIR / "effort"
+
+# Live-stream the agent's work into the Telegram message as it happens (vs a
+# single reply at the end). Set STREAMING=0 to fall back to one-shot mode.
+STREAMING: bool = os.getenv("STREAMING", "1").strip() not in ("0", "false", "False", "")
 
 # --- Obsidian vault (knowledge base + always-loaded profile) ---------------
 # File-based: the agent reads/writes plain .md files in this vault. The Profile

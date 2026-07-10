@@ -24,6 +24,8 @@ from telegram.ext import ContextTypes
 
 import config
 from bot import cards
+from bot import model as model_state
+from bot import selfupdate
 from bot import transcribe
 from bot import usage as usage_tracker
 from bot import vault
@@ -57,6 +59,7 @@ HELP_MESSAGE = (
     "/usage — расход токенов (инфографика); /usage chart — график по дням\n"
     "/context — наполненность контекста\n"
     "/compress — сжать историю диалога в саммари\n"
+    "/stop — остановить текущую выполняемую задачу\n"
     "/tools — список команд для ручной проверки инструментов\n\n"
     "Send any other text and I'll work on it for you."
 )
@@ -82,6 +85,11 @@ class AgentHandler:
         # Debounce for proactive rate-limit pings: {window: (resetsAt, tier)}.
         # In-memory only — a bot restart may re-alert once, which is acceptable.
         self._limit_alerted: dict[str, tuple] = {}
+        # Running Claude Code subprocess per chat, so /stop can cancel it.
+        self._running: dict[int, asyncio.subprocess.Process] = {}
+        # Chats whose current turn was cancelled by /stop — the turn reports
+        # "stopped" instead of an error/empty-output message.
+        self._stopped: set[int] = set()
 
     # --- Access control ----------------------------------------------------
     def _is_allowed(self, user_id: int) -> bool:
@@ -248,7 +256,11 @@ class AgentHandler:
         ``json_output`` adds ``--output-format json`` (final result + usage).
         ``stream`` adds ``--output-format stream-json`` (live event stream).
         """
-        args = [config.CLAUDE_COMMAND]
+        args = [
+            config.CLAUDE_COMMAND,
+            "--model", model_state.current_arg(),
+            "--effort", model_state.current_effort(),
+        ]
         if config.MCP_CONFIG_PATH.is_file():
             args += ["--mcp-config", str(config.MCP_CONFIG_PATH)]
         else:
@@ -524,6 +536,33 @@ class AgentHandler:
             result = await self._compress_context(chat_id)
             await self._edit(context, chat_id, note.message_id, result)
             return
+        if text.startswith("/stop"):
+            proc = self._running.get(chat_id)
+            if proc is not None and proc.returncode is None:
+                self._stopped.add(chat_id)
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await message.reply_text("🛑 остановил текущую задачу")
+            else:
+                await message.reply_text("сейчас ничего не выполняется")
+            return
+        if text.startswith("/restart"):
+            reason = text[len("/restart"):].strip() or "manual /restart"
+            selfupdate.request_restart(reason)
+            await message.reply_text("🔄 перезапускаюсь, вернусь через ~10–15с…")
+            self._schedule_restart()
+            return
+        if text.startswith("/model"):
+            arg = text[len("/model"):].strip()
+            if not arg:
+                await message.reply_text(
+                    model_state.status_text(), parse_mode=ParseMode.HTML
+                )
+            else:
+                await message.reply_text(model_state.apply(arg))
+            return
 
         # 4. Unknown slash-command → treat as a normal conversation turn.
         await self._handle_conversation(
@@ -587,6 +626,15 @@ class AgentHandler:
             )
             if usage:
                 usage_tracker.record(chat_id, usage)
+
+            # User cancelled this turn via /stop: report it cleanly and bail,
+            # skipping the error/empty-output paths the kill would otherwise hit.
+            if chat_id in self._stopped:
+                self._stopped.discard(chat_id)
+                await self._edit(
+                    context, chat_id, thinking.message_id, "🛑 остановлено"
+                )
+                return
 
             if err:
                 logger.error(
@@ -668,6 +716,16 @@ class AgentHandler:
                 tok,
             )
 
+            # h. If the agent edited its own code this turn and flagged a
+            #    restart, the reply is now delivered — bounce the process so
+            #    launchd respawns it on the new code (boot.py guards rollback).
+            if selfupdate.has_pending_restart():
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔄 применяю правку, перезапускаюсь — вернусь через ~10–15с…",
+                )
+                self._schedule_restart()
+
         except asyncio.TimeoutError:
             logger.warning(
                 "Claude Code TIMEOUT chat_id=%s after %ss (elapsed=%.2fs)",
@@ -747,11 +805,13 @@ class AgentHandler:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(config.BASE_DIR),
         )
+        self._running[chat_id] = proc
         try:
             stdout_b, stderr_b = await self._run_with_progress(
                 proc, context, chat_id, message_id, start_time
             )
         finally:
+            self._running.pop(chat_id, None)
             if proc.returncode is None:
                 try:
                     proc.kill()
@@ -859,6 +919,7 @@ class AgentHandler:
             cwd=str(config.BASE_DIR),
             limit=2 ** 20,  # 1 MB lines (stream-json results can be large)
         )
+        self._running[chat_id] = proc
 
         async def _watchdog():
             await asyncio.sleep(config.CLAUDE_TIMEOUT)
@@ -920,6 +981,7 @@ class AgentHandler:
             logger.warning("Stream read error (using partial): %s", exc)
         finally:
             wd.cancel()
+            self._running.pop(chat_id, None)
             if proc.returncode is None:
                 try:
                     proc.kill()
@@ -1012,6 +1074,19 @@ class AgentHandler:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         except TelegramError as exc:
             logger.debug("Chat action failed (ignored): %s", exc)
+
+    # --- Self-update -------------------------------------------------------
+    def _schedule_restart(self, delay: float = 1.5) -> None:
+        """Exit the process shortly, so launchd respawns it on fresh code.
+
+        We delay briefly so the in-flight Telegram sends flush first, then exit
+        hard. The plist's ``KeepAlive`` brings the bot back up via
+        ``deploy/boot.py`` (which runs the crash-rollback guard). A pending
+        ``request.json`` survives on disk and is reported once the bot is back.
+        """
+        loop = asyncio.get_event_loop()
+        logger.info("Self-update: scheduling restart in %.1fs", delay)
+        loop.call_later(delay, lambda: os._exit(0))
 
     # --- Confirmation buttons ---------------------------------------------
     @staticmethod

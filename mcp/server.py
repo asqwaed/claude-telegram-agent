@@ -18,9 +18,11 @@ Run standalone (this is what ~/.claude/mcp.json invokes)::
 """
 
 import base64
+import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -291,6 +293,141 @@ def send_telegram_file(file_path: str, caption: str = "") -> str:
         return f"error: {exc.code} {exc.read().decode('utf-8', 'replace')[:200]}"
     except urllib.error.URLError as exc:
         return f"error: {exc.reason}"
+
+
+# ===========================================================================
+# Graphviz tool — render a DOT graph and deliver the image to Telegram
+# ===========================================================================
+_GRAPHVIZ_ENGINES = {"dot", "neato", "fdp", "sfdp", "circo", "twopi"}
+_GRAPHVIZ_FORMATS = {"png", "svg", "pdf", "jpg", "gif"}
+# Formats Telegram renders inline as a photo; everything else goes as a file.
+_PHOTO_FORMATS = {"png", "jpg", "gif"}
+# brew installs the binaries here; the MCP server's PATH may not include them.
+_GRAPHVIZ_BIN_DIRS = ["/opt/homebrew/bin", "/usr/local/bin"]
+
+
+def _resolve_engine(engine: str):
+    """Return the absolute path to a Graphviz layout binary, or None."""
+    found = shutil.which(engine)
+    if found:
+        return found
+    for d in _GRAPHVIZ_BIN_DIRS:
+        cand = Path(d) / engine
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def _upload_telegram_media(method: str, field_name: str, p: Path,
+                           caption: str) -> str:
+    """Upload a local file to the user's chat via ``method`` (sendPhoto/Document).
+
+    Builds the multipart/form-data body by hand (no extra deps), mirroring
+    ``send_telegram_file``. Returns 'sent: <name>' or an error string.
+    """
+    token = config.TELEGRAM_TOKEN
+    chat_id = config.TELEGRAM_CHAT_ID
+    if not token or not chat_id:
+        return "error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not configured"
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    boundary = "----claudeagentboundary"
+    parts: list[bytes] = []
+
+    def field(name: str, value: str) -> None:
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        parts.append(f"{value}\r\n".encode())
+
+    field("chat_id", str(chat_id))
+    if caption:
+        field("caption", caption)
+
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(
+        f'Content-Disposition: form-data; name="{field_name}"; '
+        f'filename="{p.name}"\r\n'.encode()
+    )
+    parts.append(b"Content-Type: application/octet-stream\r\n\r\n")
+    try:
+        parts.append(p.read_bytes())
+    except OSError as exc:
+        return f"error: {exc}"
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+
+    req = urllib.request.Request(url, data=b"".join(parts))
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urllib.request.urlopen(
+            req, timeout=60, context=_SSL_CONTEXT
+        ) as resp:
+            if resp.status == 200:
+                return f"sent: {p.name}"
+            return f"error: HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return f"error: {exc.code} {exc.read().decode('utf-8', 'replace')[:200]}"
+    except urllib.error.URLError as exc:
+        return f"error: {exc.reason}"
+
+
+@mcp.tool()
+def graphviz_render(dot_source: str, caption: str = "", engine: str = "dot",
+                    fmt: str = "png") -> str:
+    """Render a Graphviz DOT graph to an image and send it to the user's chat.
+
+    Use this whenever the user asks for a diagram, chart, graph, tree, flow,
+    schema, state machine, or dependency map — write the graph in the DOT
+    language and this renders it and delivers the picture to Telegram directly.
+
+    Args:
+        dot_source: the graph in DOT, e.g. 'digraph G { A -> B; B -> C }'.
+        caption: optional caption shown under the image.
+        engine: layout engine — dot (hierarchy), neato/fdp (force), circo
+            (circular), twopi (radial). Default 'dot'.
+        fmt: output format — png (default, inline photo), svg/pdf (sent as a
+            file), jpg, gif.
+
+    Returns 'sent: <name>' on success, or an 'error: ...' string.
+    """
+    engine = (engine or "dot").strip().lower()
+    fmt = (fmt or "png").strip().lower()
+    if engine not in _GRAPHVIZ_ENGINES:
+        return (f"error: unknown engine '{engine}'; "
+                f"use one of {sorted(_GRAPHVIZ_ENGINES)}")
+    if fmt not in _GRAPHVIZ_FORMATS:
+        return (f"error: unknown format '{fmt}'; "
+                f"use one of {sorted(_GRAPHVIZ_FORMATS)}")
+    if not (dot_source or "").strip():
+        return "error: dot_source is empty"
+
+    binary = _resolve_engine(engine)
+    if not binary:
+        return (f"error: '{engine}' not found — install Graphviz "
+                f"(brew install graphviz)")
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="gv_"))
+    src = tmpdir / "graph.dot"
+    out = tmpdir / f"graph.{fmt}"
+    try:
+        src.write_text(dot_source, encoding="utf-8")
+        proc = subprocess.run(
+            [binary, f"-T{fmt}", str(src), "-o", str(out)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode != 0 or not out.exists():
+            err = (proc.stderr or proc.stdout or "unknown error").strip()
+            return f"error: graphviz failed: {err[:400]}"
+        if fmt in _PHOTO_FORMATS:
+            return _upload_telegram_media("sendPhoto", "photo", out, caption)
+        return _upload_telegram_media("sendDocument", "document", out, caption)
+    except subprocess.TimeoutExpired:
+        return "error: graphviz timed out (graph too large?)"
+    except OSError as exc:
+        return f"error: {exc}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ===========================================================================

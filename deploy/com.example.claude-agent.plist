@@ -21,10 +21,14 @@
     <key>Label</key>
     <string>com.example.claude-agent</string>
 
+    <!-- Launch via deploy/boot.py, not main.py directly: boot.py runs the
+         self-update rollback guard (if a self-edited version fails to boot
+         a few times in a row, it git-resets to the last known-good commit)
+         and then starts the app. -->
     <key>ProgramArguments</key>
     <array>
         <string>__PYTHON__</string>
-        <string>__PROJECT__/main.py</string>
+        <string>__PROJECT__/deploy/boot.py</string>
     </array>
 
     <key>WorkingDirectory</key>

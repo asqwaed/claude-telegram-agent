@@ -34,6 +34,11 @@ things done.
   and per-request token spend, with an optional chart.
 - **GitHub / YouTube / Spotify / SQLite** — repos & issues, video transcripts,
   music, local databases.
+- **Diagrams** — describe a graph in the DOT language and it renders it with
+  Graphviz and sends the picture straight to the chat.
+- **Self-update** — you can ask it (from Telegram) to change its own code; it
+  edits, commits a checkpoint, and restarts itself. A boot guard rolls back
+  automatically if a broken edit fails to come up (`deploy/boot.py`).
 
 ## How it talks
 
@@ -166,6 +171,9 @@ macOS **launchd** LaunchAgent — or use any process manager (`pm2`, `systemd`).
 | `/usage`, `/usage chart` | token usage + subscription limits, optional chart |
 | `/context`, `/compress` | conversation context size / compress history |
 | `/clear` | wipe conversation history (knowledge is kept) |
+| `/stop` | cancel the task the agent is currently running |
+| `/model [spec]` | show or switch the model / effort (e.g. `/model sonnet high`) |
+| `/restart` | restart the bot |
 | `/tools` | manual tool-test commands |
 
 ## Security notes
